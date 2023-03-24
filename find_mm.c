@@ -99,6 +99,19 @@ static int read_vma(struct mm_struct *mm, unsigned long addr, void *buf,
 	return buf - old_buf;
 }
 
+static void dump_elfsymbols(Elf_Shdr *sechdrs, unsigned int symindex,
+                    const char *strtab)
+{
+    Elf_Sym *sym = (void *)sechdrs[symindex].sh_addr;
+	unsigned int i, n = sechdrs[symindex].sh_size / sizeof(Elf_Sym);
+
+	pr_debug("dump_elfsymbols: n %d\n", n);
+	for (i = 1; i < n; i++) {
+		pr_debug("[ztex]i %d name <%s> 0x%llx\n", i, strtab + sym[i].st_name,
+			 sym[i].st_value);
+	}
+}
+
 /*
 Reference:
 * https://elixir.bootlin.com/linux/v5.15/source/arch/mips/kernel/vpe.c#L593
@@ -107,29 +120,73 @@ Reference:
 static int process_elf(void *buf, unsigned long size) {
     Elf_Ehdr *hdr;
     Elf_Shdr *sechdrs;
-    unsigned int relocate = 0;
-    char *secstrings;
+    struct elf_phdr *phdr;
+    unsigned int relocate = 0, symindex = 0, strindex = 0, i = 0;
+    char *secstrings, *strtab = NULL;;
 
     hdr = (Elf_Ehdr *) buf;
     if (memcmp(hdr->e_ident, ELFMAG, SELFMAG) != 0) {
-        pr_warn("[ztex] This area does not start with a legitimate elf header!\n");
         return -1;
     }
     pr_info("[ztex] found a legitimate elf header!\n");
     if (hdr->e_type == ET_REL)
 		relocate = 1;
+    if (relocate) {
+        pr_info("[ztex] we dont take care of relocation for now\n");
+        return 0;
+    }
     sechdrs = (void *)hdr + hdr->e_shoff; /* Section header table file offset */
     secstrings = (void *)hdr + sechdrs[hdr->e_shstrndx].sh_offset;
-    pr_info("[ztex] section sh_name %s\n", secstrings);
 
-    return 0;
+    if (((char *)sechdrs - (char *)hdr) > size ||
+        ((char *)secstrings - (char *)hdr) > size)
+    {
+        pr_err("[ztex] the size is too small, we should consider merge the other pages\n");
+        return -1;
+    }
+
+    phdr = (struct elf_phdr *) ((char *)hdr + hdr->e_phoff);
+    if (((char *)phdr - (char *)hdr) > size) {
+        pr_err("[ztex] the size is too small, we should consider merge the other pages\n");
+        return -1;
+    }
+    // for (i = 0; i < hdr->e_phnum; i++) {
+    //     if (phdr->p_type == PT_LOAD) {
+    //         memcpy((void *)phdr->p_paddr,
+    //                 (char *)hdr + phdr->p_offset,
+    //                 phdr->p_filesz);
+    //         memset((void *)phdr->p_paddr + phdr->p_filesz,
+    //                 0, phdr->p_memsz - phdr->p_filesz);
+    //     }
+    //     phdr++;
+    // }
+
+    // for (i = 0; i < hdr->e_shnum; i++) {
+    //     /* Internal symbols and strings. */
+    //     if (sechdrs[i].sh_type == SHT_SYMTAB) {
+    //         symindex = i;
+    //         strindex = sechdrs[i].sh_link;
+    //         strtab = (char *)hdr +
+    //             sechdrs[strindex].sh_offset;
+
+    //         /*
+    //         * mark symtab's address for when we try
+    //         * to find the magic symbols
+    //         */
+    //         sechdrs[i].sh_addr = (size_t) hdr +
+    //             sechdrs[i].sh_offset;
+    //     }
+    // }
+
+    // dump_elfsymbols(sechdrs, symindex, strtab);
+
+    return 1;
 }
 
 static int __init find_mm_init(void) {
     struct task_struct *task;
     struct mm_struct *mm;
     struct vm_area_struct *vma;
-    Elf_Ehdr *ehdr;
     int found = 0;
     unsigned long size;
     unsigned long addr;
@@ -162,30 +219,12 @@ static int __init find_mm_init(void) {
         }
         ret = read_vma(mm, addr, buf, size, FOLL_FORCE);
         buf[size] = '\0';
-        pr_info("[ztex][vma:%lx-%lx]: %s\n", vma->vm_start, vma->vm_end, buf);
-        process_elf(buf, size);
+        found |= process_elf(buf, size);
 loop_out:
         if (buf) {
             kfree(buf);
             buf = NULL;
         }
-        /*
-        if (vma->vm_file && vma->vm_file->f_op && vma->vm_file->f_op->mmap) {
-            ehdr = (Elf_Ehdr *) vma->vm_file->f_op->mmap(vma->vm_file, vma, 0);
-            if (ehdr && ehdr->e_ident[EI_MAG0] == ELFMAG0 &&
-                ehdr->e_ident[EI_MAG1] == ELFMAG1 &&
-                ehdr->e_ident[EI_MAG2] == ELFMAG2 &&
-                ehdr->e_ident[EI_MAG3] == ELFMAG3 &&
-                ehdr->e_ident[EI_CLASS] == ELFCLASS64 &&
-                ehdr->e_ident[EI_DATA] == ELFDATA2LSB &&
-                ehdr->e_ident[EI_VERSION] == EV_CURRENT &&
-                ehdr->e_ident[EI_OSABI] == ELFOSABI_LINUX &&
-                ehdr->e_type == ET_DYN) {
-                found = 1;
-                break;
-            }
-        }
-        */
     }
 
     mmput(mm);

@@ -17,57 +17,85 @@ static int pid = 0;
 
 module_param(pid, int, 0);
 
-// reference: https://stackoverflow.com/questions/60802010/linux-kernel-module-read-from-process-vma
-static int read_vma(struct mm_struct *mm, struct vm_area_struct *vma)
+/*
+Reference:
+ * https://stackoverflow.com/questions/60802010/linux-kernel-module-read-from-process-vma
+ * https://elixir.bootlin.com/linux/v5.15/source/mm/memory.c#L5118
+ * https://elixir.bootlin.com/linux/v5.15/source/mm/memory.c#L5118
+*/
+
+/*
+Here we do the following things:
+1. mmap_read_lock(mm); to get the rw_sem from mmap
+2. get_user_pages_remote(mm, vma->vm_start, 1, FOLL_FORCE, &page, NULL, NULL);
+-> to get the pages from the other userspace process
+3. offset = vma->vm_start & (PAGE_SIZE-1);
+-> to calculate the offset within the page
+4. size = vma->vm_end - vma->vm_start;
+5. if (size > PAGE_SIZE-offset) size = PAGE_SIZE-offset;
+-> take care the case that the size exceeds the page size
+6. maddr = kmap(page);
+-> map the page to the current kernel process's memory space
+7. copy_from_user_page(vma, page, vma->vm_start, buf, maddr + offset, size);
+-> copy the date from the userspace page to the buffer
+-> if ret <=0 it could be VM_IO | VM_PFNMAP VMA
+8. log the buffer
+*/
+int read_vma(struct mm_struct *mm, unsigned long addr, void *buf,
+		       int len, unsigned int gup_flags)
 {
-    void *maddr;
-    struct page *page;
-    unsigned long size;
-    char *buf = NULL;
-    int offset;
-    long ret = -1;
+    struct vm_area_struct *vma;
+	void *old_buf = buf;
+	int write = gup_flags & FOLL_WRITE;
 
-    if (!vma) {
-        pr_warn("vma is a NULL\n");
-        return ret;
-    }
-    if (!(vma->vm_flags & VM_READ)) {
-        pr_warn("vma is not a readable one\n");
-        return ret;
-    }
-    mmap_read_lock(mm);
+	if (mmap_read_lock_killable(mm))
+		return 0;
 
-    // get the page from the remote user process, which is not neccessary the current task
-    ret = get_user_pages_remote(mm, vma->vm_start, 1, FOLL_FORCE, &page, NULL, NULL);
-    if (ret <= 0) {
-        pr_err("err: %ld, Perhaps VM_IO | VM_PFNMAP VMA, we don't take care here\n", ret);
-        // reference: https://elixir.bootlin.com/linux/v5.15/source/mm/memory.c#L5118
-        ret = -1;
-        goto out;
-    }
-    offset = vma->vm_start & (PAGE_SIZE-1);
-    size = vma->vm_end - vma->vm_start;
-    // Reference: https://elixir.bootlin.com/linux/v5.15/source/mm/memory.c#L5118
-    /*
-    The size might exceed the page size, we don't take care of it here
-    */
-    if (size > PAGE_SIZE-offset)
-	    size = PAGE_SIZE-offset;
-    buf = (char *) kmalloc(size + 1, GFP_KERNEL);
-    maddr = kmap(page);
-    copy_from_user_page(vma, page, vma->vm_start, buf, maddr + offset, size);
+	/* ignore errors, just check how much was successfully transferred */
+	while (len) {
+		int bytes, ret, offset;
+		void *maddr;
+		struct page *page = NULL;
 
-    buf[size] = '\0';
-    pr_info("[ztex][vma:%lx-%lx][buff] %s\n", vma->vm_start, vma->vm_end, buf);
-    ret = 0;
+		ret = get_user_pages_remote(mm, addr, 1,
+				gup_flags, &page, &vma, NULL);
+		if (ret <= 0) {
+			/*
+			 * Check if this is a VM_IO | VM_PFNMAP VMA, which
+			 * we can access using slightly different code.
+			 */
+			vma = vma_lookup(mm, addr);
+			if (!vma)
+				break;
+			if (vma->vm_ops && vma->vm_ops->access)
+				ret = vma->vm_ops->access(vma, addr, buf,
+							  len, write);
+			if (ret <= 0)
+				break;
+			bytes = ret;
+		} else {
+			bytes = len;
+			offset = addr & (PAGE_SIZE-1);
+			if (bytes > PAGE_SIZE-offset)
+				bytes = PAGE_SIZE-offset;
 
-    kunmap(page);
-    put_page(page);
-out:
-    mmap_read_unlock(mm);
-    if (buf)
-        kfree(buf);
-    return ret;
+			maddr = kmap(page);
+			if (write) {
+                pr_err("[ztex] we dont support write here\n");
+			} else {
+				copy_from_user_page(vma, page, addr,
+						    buf, maddr + offset, bytes);
+			}
+			kunmap(page);
+			put_page(page);
+		}
+		len -= bytes;
+		buf += bytes;
+		addr += bytes;
+	}
+	mmap_read_unlock(mm);
+
+	return buf - old_buf;
 }
 
 static int __init find_mm_init(void) {
@@ -76,6 +104,10 @@ static int __init find_mm_init(void) {
     struct vm_area_struct *vma;
     Elf_Ehdr *ehdr;
     int found = 0;
+    unsigned long size;
+    unsigned long addr;
+    int ret = 0;
+    char *buf = NULL;
 
     printk(KERN_INFO "find_mm: finding mm for process with pid %d\n", pid);
 
@@ -94,7 +126,21 @@ static int __init find_mm_init(void) {
     pr_info("find_mm: searching for ELF .eh_frame information in mm for process with pid %d\n", pid);
 
     for (vma = mm->mmap; vma; vma = vma->vm_next) {
-        read_vma(mm, vma);
+        size = vma->vm_end - vma->vm_start;
+        addr = vma->vm_start;
+        buf = (char *)kmalloc(size + 1, GFP_KERNEL);
+        if (!buf) {
+            pr_err("[ztex] fail to alloc kernel buffer for [addr: %lx]:[size: %lu]\n", addr, size);
+            goto loop_out;
+        }
+        ret = read_vma(mm, addr, buf, size, FOLL_FORCE);
+        buf[size] = '\0';
+        pr_info("[ztex][vma:%lx-%lx]: %s\n", vma->vm_start, vma->vm_end, buf);
+loop_out:
+        if (buf) {
+            kfree(buf);
+            buf = NULL;
+        }
         /*
         if (vma->vm_file && vma->vm_file->f_op && vma->vm_file->f_op->mmap) {
             ehdr = (Elf_Ehdr *) vma->vm_file->f_op->mmap(vma->vm_file, vma, 0);

@@ -8,6 +8,7 @@
 #include <linux/mmap_lock.h>
 #include <linux/highmem.h>
 #include <linux/printk.h>
+#include <uapi/linux/elf.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("ztex");
@@ -41,7 +42,7 @@ Here we do the following things:
 -> if ret <=0 it could be VM_IO | VM_PFNMAP VMA
 8. log the buffer
 */
-int read_vma(struct mm_struct *mm, unsigned long addr, void *buf,
+static int read_vma(struct mm_struct *mm, unsigned long addr, void *buf,
 		       int len, unsigned int gup_flags)
 {
     struct vm_area_struct *vma;
@@ -98,6 +99,32 @@ int read_vma(struct mm_struct *mm, unsigned long addr, void *buf,
 	return buf - old_buf;
 }
 
+/*
+Reference:
+* https://elixir.bootlin.com/linux/v5.15/source/arch/mips/kernel/vpe.c#L593
+
+*/
+static int process_elf(void *buf, unsigned long size) {
+    Elf_Ehdr *hdr;
+    Elf_Shdr *sechdrs;
+    unsigned int relocate = 0;
+    char *secstrings;
+
+    hdr = (Elf_Ehdr *) buf;
+    if (memcmp(hdr->e_ident, ELFMAG, SELFMAG) != 0) {
+        pr_warn("[ztex] This area does not start with a legitimate elf header!\n");
+        return -1;
+    }
+    pr_info("[ztex] found a legitimate elf header!\n");
+    if (hdr->e_type == ET_REL)
+		relocate = 1;
+    sechdrs = (void *)hdr + hdr->e_shoff; /* Section header table file offset */
+    secstrings = (void *)hdr + sechdrs[hdr->e_shstrndx].sh_offset;
+    pr_info("[ztex] section sh_name %s\n", secstrings);
+
+    return 0;
+}
+
 static int __init find_mm_init(void) {
     struct task_struct *task;
     struct mm_struct *mm;
@@ -136,6 +163,7 @@ static int __init find_mm_init(void) {
         ret = read_vma(mm, addr, buf, size, FOLL_FORCE);
         buf[size] = '\0';
         pr_info("[ztex][vma:%lx-%lx]: %s\n", vma->vm_start, vma->vm_end, buf);
+        process_elf(buf, size);
 loop_out:
         if (buf) {
             kfree(buf);

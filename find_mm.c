@@ -112,6 +112,29 @@ static void dump_elfsymbols(Elf_Shdr *sechdrs, unsigned int symindex,
 	}
 }
 
+static void hexdump(char *buf, unsigned long size) {
+    unsigned long offset = 0;
+    while ((offset + 16) < size) {
+        pr_info("[ztex][offset:%07lx] %02x%02x %02x%02x %02x%02x %02x%02x\
+                                    %02x%02x %02x%02x %02x%02x %02x%02x\n",
+                                    offset, buf[offset], buf[offset+1],
+                                    buf[offset+2], buf[offset+3],
+                                    buf[offset+4], buf[offset+5],
+                                    buf[offset+6], buf[offset+7],
+                                    buf[offset+8], buf[offset+9],
+                                    buf[offset+10], buf[offset+11],
+                                    buf[offset+12], buf[offset+13],
+                                    buf[offset+14], buf[offset+15]);
+        offset += 16;
+    }
+    if (offset < size) {
+        pr_info("[ztex][offset:%07lx]", offset);
+        for (; offset < size; offset++) {
+            pr_info("%02x", buf[offset]);
+        }
+    }
+}
+
 /*
 Reference:
 * https://elixir.bootlin.com/linux/v5.15/source/arch/mips/kernel/vpe.c#L593
@@ -129,6 +152,9 @@ static int process_elf(void *buf, unsigned long size) {
         return -1;
     }
     pr_info("[ztex] found a legitimate elf header!\n");
+    ((char *)buf)[size-1] = '\0';
+    pr_info("[ztex][buf][size:%lu] %s\n", size, (char *)buf);
+    hexdump(buf, size);
     if (hdr->e_type == ET_REL)
 		relocate = 1;
     if (relocate) {
